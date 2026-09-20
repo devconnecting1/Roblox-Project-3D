@@ -512,7 +512,7 @@ function iniciar(): void {
 
 	// loop de atualização
 	const conn = game.GetService("RunService").Heartbeat.Connect(() => {
-		const player = Players.GetChildren()[0] as Player | undefined;
+		const player = Players.GetPlayers()[0];
 		if (player === undefined) {
 			return;
 		}
