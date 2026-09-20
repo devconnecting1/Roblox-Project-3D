@@ -55,8 +55,17 @@ function gerarModulo(rng: RNG): Modulo {
 		MODOS["blackout"];
 	let r = rng.next() * total;
 	let tipo = "room";
-	for (const [t, peso] of ["room", "hall", "largRoom", "pilar", "deadEnd", "stair", "blackout"] as const) {
-		r -= MODOS[t];
+	const ordem: [string, number][] = [
+		["room", MODOS["room"]],
+		["hall", MODOS["hall"]],
+		["largRoom", MODOS["largRoom"]],
+		["pilar", MODOS["pilar"]],
+		["deadEnd", MODOS["deadEnd"]],
+		["stair", MODOS["stair"]],
+		["blackout", MODOS["blackout"]],
+	];
+	for (const [t, peso] of ordem) {
+		r -= peso;
 		if (r <= 0) {
 			tipo = t;
 			break;
