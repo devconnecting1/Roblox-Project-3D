@@ -484,7 +484,6 @@ export function construirMapa(): void {
 	Lighting.GlobalShadows = false;
 	Lighting.Brightness = 0;
 	Lighting.ClockTime = 14;
-	Lighting.Technology = Enum.Technology.Compatibility;
 
 	// gera chunks iniciais
 	gerarChunks(0, 0);
