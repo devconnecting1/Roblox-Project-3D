@@ -42,17 +42,6 @@
 			"$properties": {
 				"FilteringEnabled": true
 			}
-		},
-		"Lighting": {
-			"$className": "Lighting",
-			"$properties": {
-				"Ambient": [20, 20, 26],
-				"OutdoorAmbient": [20, 20, 26],
-				"FogStart": 60,
-				"FogEnd": 220,
-				"GlobalShadows": true,
-				"Brightness": 1
-			}
 		}
 	}
 }
