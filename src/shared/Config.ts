@@ -12,16 +12,18 @@ export const TILES_POR_CHUNK = CHUNK_TAM / TILE_TAM;
 export const GERAR_RAIO = 3;
 export const DESCARTAR_RAIO = 5;
 export const ALTURA = 11;
+export const MAX_SALAS_SUP = 30;
+export const MAX_SALAS_SUB = 20;
 
 // Pesos dos módulos
 export const MODOS: Record<string, number> = {
-	room: 70,
-	hall: 15,
+	room: 65,
+	hall: 12,
 	largRoom: 5,
 	pilar: 5,
 	deadEnd: 3,
-	stair: 1.5,
-	blackout: 0.5,
+	stair: 8,
+	blackout: 2,
 };
 
 // Visual Backrooms

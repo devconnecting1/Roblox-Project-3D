@@ -1,6 +1,7 @@
 /**
- * Chunk manager — Backrooms Level 0 procedural.
- * Chunks 64x64 studs, 8x8 tiles. Gera ao redor do jogador, descarta longe.
+ * Backrooms Level 0 — procedural chunk manager.
+ * Phase 1: layout (30 surface + 20 underground)
+ * Phase 2: build with neighbor-aware walls
  */
 import { Lighting, Players, RunService, Workspace } from "@rbxts/services";
 import {
@@ -17,6 +18,8 @@ import {
 	COR_CHAO,
 	COR_TETO,
 	COR_LUZ,
+	MAX_SALAS_SUP,
+	MAX_SALAS_SUB,
 } from "shared/Config";
 import { RNG } from "shared/RNG";
 
@@ -26,22 +29,20 @@ interface Modulo {
 	tiles: number[][];
 }
 
-interface Chunk {
+interface ChunkData {
 	cx: number;
 	cz: number;
-	modelo: Model;
+	cy: number; // 0 = superficie, -18 = sub
+	mod: Modulo;
+	modelo: Model | undefined;
 }
 
-const chunks = new Map<string, Chunk>();
+const layout = new Map<string, ChunkData>();
+const cKey = (cx: number, cz: number, cy = 0) => `${cx},${cz},${cy}`;
+const cGet = (cx: number, cz: number, cy = 0) => layout.get(cKey(cx, cz, cy));
+const cor3 = (a: [number, number, number]) => new Color3(a[0], a[1], a[2]);
 
-function cor3(a: [number, number, number]): Color3 {
-	return new Color3(a[0], a[1], a[2]);
-}
-function chunkKey(cx: number, cz: number): string {
-	return `${cx},${cz}`;
-}
-
-// ---------- modulo ----------
+// ===================== modulo =====================
 
 function gerarModulo(rng: RNG): Modulo {
 	const total =
@@ -54,17 +55,8 @@ function gerarModulo(rng: RNG): Modulo {
 		MODOS["blackout"];
 	let r = rng.next() * total;
 	let tipo = "room";
-	const tipos: [string, number][] = [
-		["room", MODOS["room"]],
-		["hall", MODOS["hall"]],
-		["largRoom", MODOS["largRoom"]],
-		["pilar", MODOS["pilar"]],
-		["deadEnd", MODOS["deadEnd"]],
-		["stair", MODOS["stair"]],
-		["blackout", MODOS["blackout"]],
-	];
-	for (const [t, peso] of tipos) {
-		r -= peso;
+	for (const [t, peso] of ["room", "hall", "largRoom", "pilar", "deadEnd", "stair", "blackout"] as const) {
+		r -= MODOS[t];
 		if (r <= 0) {
 			tipo = t;
 			break;
@@ -72,7 +64,6 @@ function gerarModulo(rng: RNG): Modulo {
 	}
 
 	const portas = [false, false, false, false];
-	const nPortas = tipo === "deadEnd" || tipo === "blackout" ? 1 : rng.nextInt(2, 4);
 	const lados = [0, 1, 2, 3];
 	for (let i = lados.size() - 1; i > 0; i--) {
 		const j = rng.nextInt(0, i);
@@ -80,40 +71,42 @@ function gerarModulo(rng: RNG): Modulo {
 		lados[i] = lados[j];
 		lados[j] = tmp;
 	}
-	for (let i = 0; i < nPortas && i < 4; i++) {
+	const nP = tipo === "blackout" ? 0 : rng.nextInt(2, 4);
+	for (let i = 0; i < nP && i < 4; i++) {
 		portas[lados[i]] = true;
 	}
 
+	const N = TILES_POR_CHUNK;
 	const tiles: number[][] = [];
-	for (let z = 0; z < TILES_POR_CHUNK; z++) {
+	for (let z = 0; z < N; z++) {
 		tiles[z] = [];
-		for (let x = 0; x < TILES_POR_CHUNK; x++) {
+		for (let x = 0; x < N; x++) {
 			tiles[z][x] = 1;
 		}
 	}
 
-	function paredeBorda(): void {
-		for (let i = 0; i < TILES_POR_CHUNK; i++) {
+	function borda(): void {
+		for (let i = 0; i < N; i++) {
 			if (!portas[0]) {
 				tiles[0][i] = 2;
 			}
 			if (!portas[2]) {
-				tiles[TILES_POR_CHUNK - 1][i] = 2;
+				tiles[N - 1][i] = 2;
 			}
 			if (!portas[3]) {
 				tiles[i][0] = 2;
 			}
 			if (!portas[1]) {
-				tiles[i][TILES_POR_CHUNK - 1] = 2;
+				tiles[i][N - 1] = 2;
 			}
 		}
 	}
 
 	if (tipo === "room" || tipo === "largRoom" || tipo === "pilar" || tipo === "stair") {
-		paredeBorda();
+		borda();
 		if (tipo === "pilar") {
-			for (let z = 2; z < TILES_POR_CHUNK - 1; z += 3) {
-				for (let x = 2; x < TILES_POR_CHUNK - 1; x += 3) {
+			for (let z = 2; z < N - 1; z += 3) {
+				for (let x = 2; x < N - 1; x += 3) {
 					tiles[z][x] = 3;
 				}
 			}
@@ -126,52 +119,29 @@ function gerarModulo(rng: RNG): Modulo {
 		portas[3] = false;
 		portas[p1] = true;
 		portas[(p1 + 2) % 4] = true;
-		for (let z = 0; z < TILES_POR_CHUNK; z++) {
-			for (let x = 0; x < TILES_POR_CHUNK; x++) {
+		for (let z = 0; z < N; z++) {
+			for (let x = 0; x < N; x++) {
 				tiles[z][x] = 2;
 			}
 		}
 		if (p1 === 0 || p1 === 2) {
-			for (let z = 0; z < TILES_POR_CHUNK; z++) {
+			for (let z = 0; z < N; z++) {
 				for (let x = 2; x < 6; x++) {
 					tiles[z][x] = 1;
 				}
 			}
 		} else {
 			for (let z = 2; z < 6; z++) {
-				for (let x = 0; x < TILES_POR_CHUNK; x++) {
+				for (let x = 0; x < N; x++) {
 					tiles[z][x] = 1;
 				}
 			}
 		}
 	} else if (tipo === "deadEnd") {
-		for (let i = 0; i < TILES_POR_CHUNK; i++) {
-			tiles[0][i] = 2;
-			tiles[TILES_POR_CHUNK - 1][i] = 2;
-			tiles[i][0] = 2;
-			tiles[i][TILES_POR_CHUNK - 1] = 2;
-		}
-		const pa = lados[0];
-		if (pa === 0) {
-			for (let x = 2; x < 6; x++) {
-				tiles[0][x] = 1;
-			}
-		} else if (pa === 2) {
-			for (let x = 2; x < 6; x++) {
-				tiles[TILES_POR_CHUNK - 1][x] = 1;
-			}
-		} else if (pa === 3) {
-			for (let z = 2; z < 6; z++) {
-				tiles[z][0] = 1;
-			}
-		} else {
-			for (let z = 2; z < 6; z++) {
-				tiles[z][TILES_POR_CHUNK - 1] = 1;
-			}
-		}
+		borda();
 	} else if (tipo === "blackout") {
-		for (let z = 0; z < TILES_POR_CHUNK; z++) {
-			for (let x = 0; x < TILES_POR_CHUNK; x++) {
+		for (let z = 0; z < N; z++) {
+			for (let x = 0; x < N; x++) {
 				tiles[z][x] = 2;
 			}
 		}
@@ -180,7 +150,167 @@ function gerarModulo(rng: RNG): Modulo {
 	return { tipo, portas, tiles };
 }
 
-// ---------- chunk ----------
+// ===================== phase 1: layout =====================
+
+function gerarLayout(): void {
+	layout.clear();
+	const rng = new RNG(SEED);
+
+	// superficie
+	const lobby: ChunkData = { cx: 0, cz: 0, cy: 0, mod: gerarModulo(rng), modelo: undefined };
+	layout.set(cKey(0, 0, 0), lobby);
+
+	const fila: [number, number][] = [];
+	const dirs: [number, number][] = [
+		[0, -1],
+		[0, 1],
+		[-1, 0],
+		[1, 0],
+	];
+	for (const [dx, dz] of dirs) {
+		fila.push([dx, dz]);
+	}
+
+	let count = 1;
+	while (count < MAX_SALAS_SUP && fila.size() > 0) {
+		const fi = rng.nextInt(0, fila.size() - 1);
+		const [fx, fz] = fila[fi];
+		fila.remove(fi);
+
+		if (layout.has(cKey(fx, fz, 0))) {
+			continue;
+		}
+
+		const mod = gerarModulo(rng);
+		const ch: ChunkData = { cx: fx, cz: fz, cy: 0, mod, modelo: undefined };
+		layout.set(cKey(fx, fz, 0), ch);
+		count++;
+
+		for (const [dx, dz] of dirs) {
+			const nx = fx + dx;
+			const nz = fz + dz;
+			if (!layout.has(cKey(nx, nz, 0)) && count + fila.size() < MAX_SALAS_SUP + 10) {
+				fila.push([nx, nz]);
+			}
+		}
+	}
+
+	// garante portas (min 1 por sala nao-blackout)
+	for (const [, ch] of layout) {
+		if (ch.cy !== 0) {
+			continue;
+		}
+		const m = ch.mod;
+		if (m.tipo === "blackout") {
+			continue;
+		}
+		if (!m.portas[0] && !m.portas[1] && !m.portas[2] && !m.portas[3]) {
+			const rng2 = new RNG(SEED + ch.cx * 3571 + ch.cz * 3581);
+			const lado = rng2.nextInt(0, 3);
+			m.portas[lado] = true;
+			const N = TILES_POR_CHUNK;
+			if (lado === 0) {
+				for (let x = 2; x < 6; x++) {
+					m.tiles[0][x] = 1;
+				}
+			} else if (lado === 2) {
+				for (let x = 2; x < 6; x++) {
+					m.tiles[N - 1][x] = 1;
+				}
+			} else if (lado === 3) {
+				for (let z = 2; z < 6; z++) {
+					m.tiles[z][0] = 1;
+				}
+			} else {
+				for (let z = 2; z < 6; z++) {
+					m.tiles[z][N - 1] = 1;
+				}
+			}
+		}
+	}
+
+	// subterraneo: gera a partir dos modulos stair
+	const stairChunks: ChunkData[] = [];
+	for (const [, ch] of layout) {
+		if (ch.cy === 0 && ch.mod.tipo === "stair") {
+			stairChunks.push(ch);
+		}
+	}
+
+	let subCount = 0;
+	const subFila: [number, number][] = [];
+
+	for (const stair of stairChunks) {
+		if (subCount >= MAX_SALAS_SUB) {
+			break;
+		}
+		// primeira sala subterranea abaixo do stair
+		const sx = stair.cx;
+		const sz = stair.cz + 1; // ao sul do stair
+		if (!layout.has(cKey(sx, sz, -1)) && subCount < MAX_SALAS_SUB) {
+			const mod = gerarModulo(rng);
+			const ch: ChunkData = { cx: sx, cz: sz, cy: -1, mod, modelo: undefined };
+			layout.set(cKey(sx, sz, -1), ch);
+			subCount++;
+			subFila.push([sx, sz]);
+		}
+	}
+
+	// expande subterraneo
+	while (subCount < MAX_SALAS_SUB && subFila.size() > 0) {
+		const fi = rng.nextInt(0, subFila.size() - 1);
+		const [fx, fz] = subFila[fi];
+		subFila.remove(fi);
+
+		for (const [dx, dz] of dirs) {
+			const nx = fx + dx;
+			const nz = fz + dz;
+			if (!layout.has(cKey(nx, nz, -1)) && subCount < MAX_SALAS_SUB) {
+				const mod = gerarModulo(rng);
+				const ch: ChunkData = { cx: nx, cz: nz, cy: -1, mod, modelo: undefined };
+				layout.set(cKey(nx, nz, -1), ch);
+				subCount++;
+				subFila.push([nx, nz]);
+			}
+		}
+	}
+
+	// garante portas no subterraneo
+	for (const [, ch] of layout) {
+		if (ch.cy !== -1) {
+			continue;
+		}
+		const m = ch.mod;
+		if (m.tipo === "blackout") {
+			continue;
+		}
+		if (!m.portas[0] && !m.portas[1] && !m.portas[2] && !m.portas[3]) {
+			const rng2 = new RNG(SEED + ch.cx * 3571 + ch.cz * 3581 + 999);
+			const lado = rng2.nextInt(0, 3);
+			m.portas[lado] = true;
+			const N = TILES_POR_CHUNK;
+			if (lado === 0) {
+				for (let x = 2; x < 6; x++) {
+					m.tiles[0][x] = 1;
+				}
+			} else if (lado === 2) {
+				for (let x = 2; x < 6; x++) {
+					m.tiles[N - 1][x] = 1;
+				}
+			} else if (lado === 3) {
+				for (let z = 2; z < 6; z++) {
+					m.tiles[z][0] = 1;
+				}
+			} else {
+				for (let z = 2; z < 6; z++) {
+					m.tiles[z][N - 1] = 1;
+				}
+			}
+		}
+	}
+}
+
+// ===================== phase 2: build =====================
 
 function mkPart(
 	nome: string,
@@ -205,14 +335,16 @@ function mkPart(
 	return p;
 }
 
-function construirChunk(cx: number, cz: number): Chunk {
+function construirChunk(ch: ChunkData): void {
 	const modelo = new Instance("Model");
-	modelo.Name = `Chunk_${cx}_${cz}`;
+	modelo.Name = `Chunk_${ch.cx}_${ch.cz}_${ch.cy}`;
 
-	const bx = cx * CHUNK_TAM;
-	const bz = cz * CHUNK_TAM;
-	const rng = new RNG(SEED + cx * 7919 + cz * 7907);
-	const mod = gerarModulo(rng);
+	const bx = ch.cx * CHUNK_TAM;
+	const bz = ch.cz * CHUNK_TAM;
+	const baseY = ch.cy;
+	const N = TILES_POR_CHUNK;
+	const rng = new RNG(SEED + ch.cx * 7919 + ch.cz * 7907 + ch.cy * 12345);
+	const mod = ch.mod;
 
 	const chaoCor = cor3(COR_CHAO);
 	const tetoCor = cor3(COR_TETO);
@@ -224,7 +356,7 @@ function construirChunk(cx: number, cz: number): Chunk {
 	mkPart(
 		"Chao",
 		new Vector3(CHUNK_TAM, 1, CHUNK_TAM),
-		new Vector3(bx + CHUNK_TAM / 2, -0.5, bz + CHUNK_TAM / 2),
+		new Vector3(bx + CHUNK_TAM / 2, baseY - 0.5, bz + CHUNK_TAM / 2),
 		chaoCor,
 		Enum.Material.Plastic,
 		true,
@@ -233,16 +365,16 @@ function construirChunk(cx: number, cz: number): Chunk {
 	mkPart(
 		"Teto",
 		new Vector3(CHUNK_TAM, 1, CHUNK_TAM),
-		new Vector3(bx + CHUNK_TAM / 2, ALTURA + 0.5, bz + CHUNK_TAM / 2),
+		new Vector3(bx + CHUNK_TAM / 2, baseY + ALTURA + 0.5, bz + CHUNK_TAM / 2),
 		tetoCor,
 		Enum.Material.Plastic,
 		true,
 		modelo,
 	);
 
-	// tiles
-	for (let z = 0; z < TILES_POR_CHUNK; z++) {
-		for (let x = 0; x < TILES_POR_CHUNK; x++) {
+	// tiles internos
+	for (let z = 0; z < N; z++) {
+		for (let x = 0; x < N; x++) {
 			const t = mod.tiles[z][x];
 			const tx = bx + x * TILE_TAM + TILE_TAM / 2;
 			const tz = bz + z * TILE_TAM + TILE_TAM / 2;
@@ -251,7 +383,7 @@ function construirChunk(cx: number, cz: number): Chunk {
 				mkPart(
 					`W_${x}_${z}`,
 					new Vector3(TILE_TAM, ALTURA, TILE_TAM),
-					new Vector3(tx, ALTURA / 2, tz),
+					new Vector3(tx, baseY + ALTURA / 2, tz),
 					c,
 					Enum.Material.Plastic,
 					true,
@@ -261,13 +393,98 @@ function construirChunk(cx: number, cz: number): Chunk {
 				mkPart(
 					`P_${x}_${z}`,
 					new Vector3(TILE_TAM * 0.6, ALTURA, TILE_TAM * 0.6),
-					new Vector3(tx, ALTURA / 2, tz),
+					new Vector3(tx, baseY + ALTURA / 2, tz),
 					p1,
 					Enum.Material.Plastic,
 					true,
 					modelo,
 				);
 			}
+		}
+	}
+
+	// paredes entre chunks (neighbor-aware)
+	const vizN = cGet(ch.cx, ch.cz - 1, ch.cy);
+	const vizS = cGet(ch.cx, ch.cz + 1, ch.cy);
+	const vizW = cGet(ch.cx - 1, ch.cz, ch.cy);
+	const vizE = cGet(ch.cx + 1, ch.cz, ch.cy);
+
+	// norte
+	if (!mod.portas[0] && !(vizN !== undefined && vizN.mod.portas[2])) {
+		for (let x = 0; x < N; x++) {
+			if (mod.tiles[0][x] === 2) {
+				continue;
+			}
+			const xW = bx + x * TILE_TAM + TILE_TAM / 2;
+			const c = rng.next() > 0.5 ? p1 : p2;
+			mkPart(
+				`BN_${x}`,
+				new Vector3(TILE_TAM, ALTURA, TILE_TAM),
+				new Vector3(xW, baseY + ALTURA / 2, bz),
+				c,
+				Enum.Material.Plastic,
+				true,
+				modelo,
+			);
+		}
+	}
+	// sul
+	if (!mod.portas[2] && !(vizS !== undefined && vizS.mod.portas[0])) {
+		for (let x = 0; x < N; x++) {
+			if (mod.tiles[N - 1][x] === 2) {
+				continue;
+			}
+			const xW = bx + x * TILE_TAM + TILE_TAM / 2;
+			const zW = bz + CHUNK_TAM;
+			const c = rng.next() > 0.5 ? p1 : p2;
+			mkPart(
+				`BS_${x}`,
+				new Vector3(TILE_TAM, ALTURA, TILE_TAM),
+				new Vector3(xW, baseY + ALTURA / 2, zW),
+				c,
+				Enum.Material.Plastic,
+				true,
+				modelo,
+			);
+		}
+	}
+	// oeste
+	if (!mod.portas[3] && !(vizW !== undefined && vizW.mod.portas[1])) {
+		for (let z = 0; z < N; z++) {
+			if (mod.tiles[z][0] === 2) {
+				continue;
+			}
+			const zW = bz + z * TILE_TAM + TILE_TAM / 2;
+			const c = rng.next() > 0.5 ? p1 : p2;
+			mkPart(
+				`BW_${z}`,
+				new Vector3(TILE_TAM, ALTURA, TILE_TAM),
+				new Vector3(bx, baseY + ALTURA / 2, zW),
+				c,
+				Enum.Material.Plastic,
+				true,
+				modelo,
+			);
+		}
+	}
+	// leste
+	if (!mod.portas[1] && !(vizE !== undefined && vizE.mod.portas[3])) {
+		for (let z = 0; z < N; z++) {
+			if (mod.tiles[z][N - 1] === 2) {
+				continue;
+			}
+			const xW = bx + CHUNK_TAM;
+			const zW = bz + z * TILE_TAM + TILE_TAM / 2;
+			const c = rng.next() > 0.5 ? p1 : p2;
+			mkPart(
+				`BE_${z}`,
+				new Vector3(TILE_TAM, ALTURA, TILE_TAM),
+				new Vector3(xW, baseY + ALTURA / 2, zW),
+				c,
+				Enum.Material.Plastic,
+				true,
+				modelo,
+			);
 		}
 	}
 
@@ -280,7 +497,7 @@ function construirChunk(cx: number, cz: number): Chunk {
 			const tubo = mkPart(
 				`Fluor_${i}`,
 				new Vector3(0.4, 0.3, CHUNK_TAM * 0.6),
-				new Vector3(lx, ALTURA - 0.15, lz),
+				new Vector3(lx, baseY + ALTURA - 0.15, lz),
 				new Color3(0.95, 0.95, 0.9),
 				Enum.Material.Neon,
 				false,
@@ -288,31 +505,22 @@ function construirChunk(cx: number, cz: number): Chunk {
 			);
 			const pl = new Instance("PointLight");
 			pl.Color = lzCor;
-			pl.Range = 40;
-			pl.Brightness = 1.2;
+			pl.Range = 45;
+			pl.Brightness = 1.5;
 			pl.Shadows = false;
 			pl.Parent = tubo;
 		}
 	}
 
-	// escada subterranea
-	if (mod.tipo === "stair") {
+	// escada subterranea (só na superficie)
+	if (mod.tipo === "stair" && ch.cy === 0) {
 		const sx = bx + CHUNK_TAM / 2 - 8;
 		const sz = bz + CHUNK_TAM / 2;
 		const deg = 8;
 		const dxSt = 2;
-		const dySt = 16 / deg;
+		const dySt = 18 / deg;
 
-		mkPart(
-			"Buraco",
-			new Vector3(dxSt * deg + 3, 1.2, 5),
-			new Vector3(sx + (deg * dxSt) / 2, -0.5, sz),
-			new Color3(0.08, 0.08, 0.1),
-			Enum.Material.Plastic,
-			false,
-			modelo,
-		);
-
+		// degraus descendo
 		for (let i = 0; i < deg; i++) {
 			mkPart(
 				`Deg_${i}`,
@@ -325,91 +533,13 @@ function construirChunk(cx: number, cz: number): Chunk {
 			);
 		}
 
-		const subCX = sx + deg * dxSt + 12;
-		const subCZ = sz;
-		const subY = -16;
-		const subL = 24;
-		const subP = 20;
-		const subH = ALTURA / 2 + subY;
-
+		// corredor vertical连接ando escada ao sub
+		const connCx = (sx + (deg - 1) * dxSt) / 2;
+		const connL = deg * dxSt + 4;
 		mkPart(
-			"Sub_Chao",
-			new Vector3(subL, 1, subP),
-			new Vector3(subCX, subY - 0.5, subCZ),
-			chaoCor,
-			Enum.Material.Plastic,
-			true,
-			modelo,
-		);
-		mkPart(
-			"Sub_Teto",
-			new Vector3(subL, 1, subP),
-			new Vector3(subCX, subY + ALTURA + 0.5, subCZ),
-			tetoCor,
-			Enum.Material.Plastic,
-			true,
-			modelo,
-		);
-		mkPart(
-			"Sub_N",
-			new Vector3(subL, ALTURA, 2),
-			new Vector3(subCX, subH, subCZ - subP / 2),
-			p1,
-			Enum.Material.Plastic,
-			true,
-			modelo,
-		);
-		mkPart(
-			"Sub_S",
-			new Vector3(subL, ALTURA, 2),
-			new Vector3(subCX, subH, subCZ + subP / 2),
-			p1,
-			Enum.Material.Plastic,
-			true,
-			modelo,
-		);
-		mkPart(
-			"Sub_W",
-			new Vector3(2, ALTURA, subP),
-			new Vector3(subCX - subL / 2, subH, subCZ),
-			p1,
-			Enum.Material.Plastic,
-			true,
-			modelo,
-		);
-		mkPart(
-			"Sub_E",
-			new Vector3(2, ALTURA, subP),
-			new Vector3(subCX + subL / 2, subH, subCZ),
-			p1,
-			Enum.Material.Plastic,
-			true,
-			modelo,
-		);
-
-		const subLuz = mkPart(
-			"Sub_Luz",
-			new Vector3(0.4, 0.3, subL * 0.6),
-			new Vector3(subCX, subY + ALTURA - 0.15, subCZ),
-			new Color3(0.95, 0.95, 0.9),
-			Enum.Material.Neon,
-			false,
-			modelo,
-		);
-		const spl = new Instance("PointLight");
-		spl.Color = lzCor;
-		spl.Range = 35;
-		spl.Brightness = 1;
-		spl.Shadows = false;
-		spl.Parent = subLuz;
-
-		// corredor conectando escada a sub-sala
-		const connL = math.abs(subCX - sx - deg * dxSt) + 4;
-		const connCx = (sx + deg * dxSt + subCX) / 2;
-		mkPart(
-			"Sub_Conn",
+			"Stair_Conn",
 			new Vector3(connL, ALTURA, 4),
-			new Vector3(connCx, subH, subCZ),
+			new Vector3(connCx, -9, sz),
 			p1,
 			Enum.Material.Plastic,
 			true,
@@ -418,10 +548,10 @@ function construirChunk(cx: number, cz: number): Chunk {
 	}
 
 	modelo.Parent = Workspace;
-	return { cx, cz, modelo };
+	ch.modelo = modelo;
 }
 
-// ---------- chunk streaming ----------
+// ===================== streaming =====================
 
 function gerarChunks(jX: number, jZ: number): void {
 	const jcX = math.floor(jX / CHUNK_TAM);
@@ -429,29 +559,38 @@ function gerarChunks(jX: number, jZ: number): void {
 
 	for (let dx = -GERAR_RAIO; dx <= GERAR_RAIO; dx++) {
 		for (let dz = -GERAR_RAIO; dz <= GERAR_RAIO; dz++) {
-			const key = chunkKey(jcX + dx, jcZ + dz);
-			if (!chunks.has(key)) {
-				chunks.set(key, construirChunk(jcX + dx, jcZ + dz));
+			const key = cKey(jcX + dx, jcZ + dz, 0);
+			if (!layout.has(key)) {
+				const rng = new RNG(SEED + (jcX + dx) * 7919 + (jcZ + dz) * 7907);
+				const ch: ChunkData = { cx: jcX + dx, cz: jcZ + dz, cy: 0, mod: gerarModulo(rng), modelo: undefined };
+				layout.set(key, ch);
+			}
+			const ch = layout.get(key)!;
+			if (ch.modelo === undefined) {
+				construirChunk(ch);
 			}
 		}
 	}
 
+	// descarta longe
 	const ap: string[] = [];
-	for (const [key, ch] of chunks) {
-		if (math.abs(ch.cx - jcX) > DESCARTAR_RAIO || math.abs(ch.cz - jcZ) > DESCARTAR_RAIO) {
+	for (const [key, ch] of layout) {
+		if (
+			ch.modelo !== undefined &&
+			ch.cy === 0 &&
+			(math.abs(ch.cx - jcX) > DESCARTAR_RAIO || math.abs(ch.cz - jcZ) > DESCARTAR_RAIO)
+		) {
+			ch.modelo.Destroy();
+			ch.modelo = undefined;
 			ap.push(key);
 		}
 	}
 	for (const key of ap) {
-		const ch = chunks.get(key);
-		if (ch !== undefined) {
-			ch.modelo.Destroy();
-			chunks.delete(key);
-		}
+		layout.delete(key);
 	}
 }
 
-// ---------- init ----------
+// ===================== init =====================
 
 let init = false;
 
@@ -461,18 +600,15 @@ export function construirMapa(): void {
 	}
 	init = true;
 
-	// limpa TUDO do workspace (menos Terrain)
+	// limpa TUDO
 	for (const c of Workspace.GetChildren()) {
-		if (c.IsA("Terrain")) {
-			continue;
-		}
-		if (c.Name === "Camera") {
+		if (c.IsA("Terrain") || c.Name === "Camera") {
 			continue;
 		}
 		c.Destroy();
 	}
 
-	// limpa Lighting: remove Boom, ColorGrading, SunRays, etc
+	// limpa Lighting
 	for (const c of Lighting.GetChildren()) {
 		c.Destroy();
 	}
@@ -485,10 +621,15 @@ export function construirMapa(): void {
 	Lighting.Brightness = 0;
 	Lighting.ClockTime = 14;
 
-	// gera chunks iniciais
-	gerarChunks(0, 0);
+	// layout
+	gerarLayout();
 
-	// spawn DENTRO do chunk (chao em Y=0, spawn em Y=1)
+	// build tudo
+	for (const [, ch] of layout) {
+		construirChunk(ch);
+	}
+
+	// spawn
 	const spawn = new Instance("SpawnLocation");
 	spawn.Name = "Spawn";
 	spawn.Size = new Vector3(6, 1, 6);
@@ -501,7 +642,7 @@ export function construirMapa(): void {
 	spawn.BottomSurface = Enum.SurfaceType.Smooth;
 	spawn.Parent = Workspace;
 
-	// heartbeat: gerar chunks ao redor do jogador
+	// streaming
 	RunService.Heartbeat.Connect(() => {
 		const pl = Players.GetPlayers()[0];
 		if (pl === undefined) {
@@ -518,5 +659,14 @@ export function construirMapa(): void {
 		gerarChunks(hrp.Position.X, hrp.Position.Z);
 	});
 
-	print("[Backrooms] Mapa gerado. Seed:", SEED);
+	let sup = 0;
+	let sub = 0;
+	for (const [, ch] of layout) {
+		if (ch.cy === 0) {
+			sup++;
+		} else {
+			sub++;
+		}
+	}
+	print(`[Backrooms] Sup: ${sup}, Sub: ${sub}`);
 }
