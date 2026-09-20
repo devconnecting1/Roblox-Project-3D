@@ -3,215 +3,264 @@
  * + escadas para salas secretas subterrâneas.
  *
  * Zero Interface. Material = Plastic apenas. Sem imóveis estáticos.
- * Mesmo seed = mesmo mapa sempre (Minecraft-style).
+ * Mesmo seed = mesmo mapa sempre.
+ *
+ * Algoritmo: 2 fases
+ *   1) Determina posições e conexões (BFS sem RNG extra)
+ *   2) Constrói tudo uma vez só
  */
 import { Lighting, Workspace } from "@rbxts/services";
-import {
-	SEED,
-	ALTURA,
-	TAM_LOBBY,
-	TAM_SALA,
-	PORTA_LARG,
-	SALAS_MAX,
-	PROFUNDIDADE,
-	CHANCE_ESCADA,
-	CBASE,
-} from "shared/Config";
+import { SEED, ALTURA, TAM_LOBBY, PORTA_LARG, SALAS_MAX, PROFUNDIDADE, CHANCE_ESCADA } from "shared/Config";
 import { RNG } from "shared/RNG";
 
 const rng = new RNG(SEED);
 
+const TAMOS = [14, 22, 32];
+const TIPOS = ["pequena", "media", "grande"];
+const PW = 2;
+const GAP = 4;
+
+let idGen = 0;
+
 interface Sala {
 	id: number;
-	tipo: "pequena" | "media" | "grande";
+	tipo: string;
 	larg: number;
 	prof: number;
 	cx: number;
 	cz: number;
-	cy: number; // 0 = superfície, < 0 = subsolo
-	portas: [number, number][]; // [centro, largura] por parede
-	subsolos: number; // quantos sub-salos este tipo gerou
+	cy: number;
+	portas: number[]; // ids das salas adjacentes com abertura
 }
 
 const salas: Sala[] = [];
-let idGlobal = 0;
+const links: [number, number][] = [];
 
-// --- Helpers ---
+// ================== helpers ==================
 
-function bloco(
-	nome: string,
-	tam: Vector3,
-	pos: Vector3,
-	cor: Color3,
-	mat: Enum.Material = Enum.Material.Plastic,
-): Part {
+function bloco(nome: string, tam: Vector3, pos: Vector3, cor: Color3, colidi = true): Part {
 	const p = new Instance("Part");
 	p.Name = nome;
 	p.Size = tam;
 	p.Position = pos;
 	p.Color = cor;
-	p.Material = mat;
+	p.Material = Enum.Material.Plastic;
 	p.Anchored = true;
-	p.CanCollide = true;
+	p.CanCollide = colidi;
 	p.TopSurface = Enum.SurfaceType.Smooth;
 	p.BottomSurface = Enum.SurfaceType.Smooth;
 	p.Parent = Workspace;
 	return p;
 }
 
-function corSala(tipo: string): Color3 {
-	const cores: Record<string, [number, number, number]> = {
-		pequena: [0.42, 0.4, 0.37],
-		media: [0.35, 0.38, 0.42],
-		grande: [0.28, 0.3, 0.34],
-	};
-	const c = cores[tipo] ?? [0.35, 0.35, 0.35];
-	return new Color3(c[0], c[1], c[2]);
+function salaCores(tipo: string): [Color3, Color3] {
+	if (tipo === "pequena") {
+		return [new Color3(0.42, 0.4, 0.37), new Color3(0.33, 0.31, 0.29)];
+	}
+	if (tipo === "media") {
+		return [new Color3(0.35, 0.38, 0.42), new Color3(0.27, 0.29, 0.33)];
+	}
+	return [new Color3(0.28, 0.3, 0.34), new Color3(0.22, 0.24, 0.28)];
 }
 
-function corParede(tipo: string): Color3 {
-	const cores: Record<string, [number, number, number]> = {
-		pequena: [0.33, 0.31, 0.29],
-		media: [0.27, 0.29, 0.33],
-		grande: [0.22, 0.24, 0.28],
-	};
-	const c = cores[tipo] ?? [0.3, 0.3, 0.3];
-	return new Color3(c[0], c[1], c[2]);
-}
-
-function salaNome(s: Sala): string {
-	return `${s.id}_${s.tipo}_${s.cy < 0 ? "sub" : "sup"}`;
-}
-
-/** Collision check AABB (ignora eixo Y). */
-function colide(cx: number, cz: number, larg: number, prof: number, ignorarId: number): boolean {
+function colide(cx: number, cz: number, larg: number, prof: number): boolean {
 	for (const s of salas) {
-		if (s.id === ignorarId) {
-			continue;
-		}
-		if (math.abs(cx - s.cx) < (larg + s.larg) / 2 + 2 && math.abs(cz - s.cz) < (prof + s.prof) / 2 + 2) {
+		if (math.abs(cx - s.cx) < (larg + s.larg) / 2 + 3 && math.abs(cz - s.cz) < (prof + s.prof) / 2 + 3) {
 			return true;
 		}
 	}
 	return false;
 }
 
-// --- Construção de sala ---
+function find(id: number): Sala | undefined {
+	for (const s of salas) {
+		if (s.id === id) {
+			return s;
+		}
+	}
+	return undefined;
+}
+
+function segmentarParede(
+	inicio: number,
+	fim: number,
+	centrosPorta: number[],
+	largPorta: number,
+): { cx: number; w: number }[] {
+	const segs: { cx: number; w: number }[] = [];
+	let cur = inicio;
+	for (const pc of centrosPorta) {
+		const pIni = pc - largPorta / 2;
+		const pFim = pc + largPorta / 2;
+		if (pIni > cur) {
+			segs.push({ cx: (cur + pIni) / 2, w: pIni - cur });
+		}
+		cur = pFim;
+	}
+	if (cur < fim) {
+		segs.push({ cx: (cur + fim) / 2, w: fim - cur });
+	}
+	return segs;
+}
+
+// ================== fase 1: determinar layout ==================
+
+function determinarLayout(): void {
+	salas.clear();
+	links.clear();
+	idGen = 0;
+
+	// lobby
+	const lobby: Sala = {
+		id: ++idGen,
+		tipo: "grande",
+		larg: TAM_LOBBY,
+		prof: TAM_LOBBY,
+		cx: 0,
+		cz: 0,
+		cy: 0,
+		portas: [],
+	};
+	salas.push(lobby);
+
+	// BFS
+	type Cand = { paiId: number; dx: number; dz: number };
+	const allDirs = [
+		{ dx: 1, dz: 0 },
+		{ dx: -1, dz: 0 },
+		{ dx: 0, dz: 1 },
+		{ dx: 0, dz: -1 },
+	];
+
+	const fila: Cand[] = [];
+	for (const d of allDirs) {
+		fila.push({ paiId: lobby.id, dx: d.dx, dz: d.dz });
+	}
+
+	while (salas.size() < SALAS_MAX && fila.size() > 0) {
+		const fi = rng.nextInt(0, fila.size() - 1);
+		const cand = fila[fi];
+		fila.remove(fi);
+
+		const pai = find(cand.paiId);
+		if (pai === undefined) {
+			continue;
+		}
+
+		const tipoIdx = rng.nextInt(0, 2);
+		const novoT = TAMOS[tipoIdx];
+		const novoNome = TIPOS[tipoIdx];
+
+		const ncx = cand.dx !== 0 ? pai.cx + cand.dx * ((pai.larg + novoT) / 2 + GAP) : pai.cx;
+		const ncz = cand.dz !== 0 ? pai.cz + cand.dz * ((pai.prof + novoT) / 2 + GAP) : pai.cz;
+
+		if (colide(ncx, ncz, novoT, novoT)) {
+			continue;
+		}
+
+		const nova: Sala = { id: ++idGen, tipo: novoNome, larg: novoT, prof: novoT, cx: ncx, cz: ncz, cy: 0, portas: [] };
+		salas.push(nova);
+		links.push([pai.id, nova.id]);
+		nova.portas.push(pai.id);
+		pai.portas.push(nova.id);
+
+		// filhos
+		const nFilhos = rng.nextInt(1, 3);
+		for (let i = 0; i < nFilhos && salas.size() + fila.size() < SALAS_MAX; i++) {
+			const d = rng.choose(allDirs);
+			fila.push({ paiId: nova.id, dx: d.dx, dz: d.dz });
+		}
+	}
+}
+
+// ================== fase 2: construir tudo ==================
 
 function construirSala(s: Sala): void {
+	const [chaoCor, paredeCor] = salaCores(s.tipo);
 	const x0 = s.cx - s.larg / 2;
 	const x1 = s.cx + s.larg / 2;
 	const z0 = s.cz - s.prof / 2;
 	const z1 = s.cz + s.prof / 2;
-	const base = s.cy;
-	const nome = salaNome(s);
-	const paredeCor = corParede(s.tipo);
-	const chaoCor = corSala(s.tipo);
+	const h = ALTURA / 2 + s.cy;
+	const n = `${s.id}_${s.tipo}`;
 
-	// Chão
-	bloco(`${nome}_Chao`, new Vector3(s.larg + 2, 2, s.prof + 2), new Vector3(s.cx, base - 1, s.cz), chaoCor);
-	// Teto
+	// chão + teto
+	bloco(`${n}_Chao`, new Vector3(s.larg, 2, s.prof), new Vector3(s.cx, s.cy - 1, s.cz), chaoCor);
 	bloco(
-		`${nome}_Teto`,
-		new Vector3(s.larg + 2, 2, s.prof + 2),
-		new Vector3(s.cx, base + ALTURA + 1, s.cz),
+		`${n}_Teto`,
+		new Vector3(s.larg, 2, s.prof),
+		new Vector3(s.cx, s.cy + ALTURA + 1, s.cz),
 		new Color3(0.18, 0.19, 0.22),
 	);
 
-	// Paredes: segmentos ao longo de X (norte/sul) e Z (oeste/leste)
-	const larguraParede = 2;
-	const h = ALTURA / 2 + base;
-
-	// Norte (z0) — vãos = [centroX, largura]
-	const nOrd = [...s.portas].sort((a, b) => a[0] < b[0]);
-	let curX = x0;
-	for (const [c, l] of nOrd) {
-		const ate = c - l / 2;
-		if (ate > curX) {
-			bloco(
-				`${nome}_N_${curX}`,
-				new Vector3(ate - curX, ALTURA, larguraParede),
-				new Vector3((curX + ate) / 2, h, z0),
-				paredeCor,
-			);
+	// norte (z0): portas = salas com cz < s.cz
+	const nPortas: number[] = [];
+	for (const pid of s.portas) {
+		const o = find(pid);
+		if (o !== undefined && o.cz < s.cz) {
+			nPortas.push(o.cx);
 		}
-		curX = c + l / 2;
 	}
-	if (curX < x1) {
-		bloco(`${nome}_N_F`, new Vector3(x1 - curX, ALTURA, larguraParede), new Vector3((curX + x1) / 2, h, z0), paredeCor);
+	nPortas.sort((a, b) => a < b);
+	for (const seg of segmentarParede(x0, x1, nPortas, PORTA_LARG)) {
+		bloco(`${n}_N_${seg.cx}`, new Vector3(seg.w, ALTURA, PW), new Vector3(seg.cx, h, z0), paredeCor);
 	}
 
-	// Sul (z1)
-	curX = x0;
-	for (const [c, l] of nOrd) {
-		const ate = c - l / 2;
-		if (ate > curX) {
-			bloco(
-				`${nome}_S_${curX}`,
-				new Vector3(ate - curX, ALTURA, larguraParede),
-				new Vector3((curX + ate) / 2, h, z1),
-				paredeCor,
-			);
+	// sul (z1): salas com cz > s.cz
+	const sPortas: number[] = [];
+	for (const pid of s.portas) {
+		const o = find(pid);
+		if (o !== undefined && o.cz > s.cz) {
+			sPortas.push(o.cx);
 		}
-		curX = c + l / 2;
 	}
-	if (curX < x1) {
-		bloco(`${nome}_S_F`, new Vector3(x1 - curX, ALTURA, larguraParede), new Vector3((curX + x1) / 2, h, z1), paredeCor);
+	sPortas.sort((a, b) => a < b);
+	for (const seg of segmentarParede(x0, x1, sPortas, PORTA_LARG)) {
+		bloco(`${n}_S_${seg.cx}`, new Vector3(seg.w, ALTURA, PW), new Vector3(seg.cx, h, z1), paredeCor);
 	}
 
-	// Oeste (x0) — vãos = [centroZ, largura]
-	const oOrd = [...s.portas].sort((a, b) => a[0] < b[0]);
-	let curZ = z0;
-	for (const [c, l] of oOrd) {
-		const ate = c - l / 2;
-		if (ate > curZ) {
-			bloco(
-				`${nome}_W_${curZ}`,
-				new Vector3(larguraParede, ALTURA, ate - curZ),
-				new Vector3(x0, h, (curZ + ate) / 2),
-				paredeCor,
-			);
+	// oeste (x0): salas com cx < s.cx
+	const wPortas: number[] = [];
+	for (const pid of s.portas) {
+		const o = find(pid);
+		if (o !== undefined && o.cx < s.cx) {
+			wPortas.push(o.cz);
 		}
-		curZ = c + l / 2;
 	}
-	if (curZ < z1) {
-		bloco(`${nome}_W_F`, new Vector3(larguraParede, ALTURA, z1 - curZ), new Vector3(x0, h, (curZ + z1) / 2), paredeCor);
+	wPortas.sort((a, b) => a < b);
+	for (const seg of segmentarParede(z0, z1, wPortas, PORTA_LARG)) {
+		bloco(`${n}_W_${seg.cx}`, new Vector3(PW, ALTURA, seg.w), new Vector3(x0, h, seg.cx), paredeCor);
 	}
 
-	// Leste (x1)
-	curZ = z0;
-	for (const [c, l] of oOrd) {
-		const ate = c - l / 2;
-		if (ate > curZ) {
-			bloco(
-				`${nome}_E_${curZ}`,
-				new Vector3(larguraParede, ALTURA, ate - curZ),
-				new Vector3(x1, h, (curZ + ate) / 2),
-				paredeCor,
-			);
+	// leste (x1): salas com cx > s.cx
+	const ePortas: number[] = [];
+	for (const pid of s.portas) {
+		const o = find(pid);
+		if (o !== undefined && o.cx > s.cx) {
+			ePortas.push(o.cz);
 		}
-		curZ = c + l / 2;
 	}
-	if (curZ < z1) {
-		bloco(`${nome}_E_F`, new Vector3(larguraParede, ALTURA, z1 - curZ), new Vector3(x1, h, (curZ + z1) / 2), paredeCor);
+	ePortas.sort((a, b) => a < b);
+	for (const seg of segmentarParede(z0, z1, ePortas, PORTA_LARG)) {
+		bloco(`${n}_E_${seg.cx}`, new Vector3(PW, ALTURA, seg.w), new Vector3(x1, h, seg.cx), paredeCor);
 	}
 
-	// Luzes pontuais
+	// luzes
 	if (s.larg >= 20) {
 		const cols = s.larg >= 30 ? 3 : 2;
-		const filas = s.prof >= 30 ? 3 : 2;
+		const linhas = s.prof >= 30 ? 3 : 2;
 		for (let i = 0; i < cols; i++) {
-			for (let j = 0; j < filas; j++) {
+			for (let j = 0; j < linhas; j++) {
 				const lx = x0 + (s.larg * (i + 1)) / (cols + 1);
-				const lz = z0 + (s.prof * (j + 1)) / (filas + 1);
+				const lz = z0 + (s.prof * (j + 1)) / (linhas + 1);
 				const lamp = bloco(
-					`${nome}_Lamp_${i}_${j}`,
+					`${n}_L${i}${j}`,
 					new Vector3(2, 1, 2),
-					new Vector3(lx, base + ALTURA - 1, lz),
+					new Vector3(lx, s.cy + ALTURA - 1, lz),
 					new Color3(0, 0, 0),
+					false,
 				);
 				lamp.Transparency = 1;
-				lamp.CanCollide = false;
 				const pl = new Instance("PointLight");
 				pl.Color = new Color3(1, 0.93, 0.78);
 				pl.Range = 30;
@@ -222,13 +271,13 @@ function construirSala(s: Sala): void {
 		}
 	} else {
 		const lamp = bloco(
-			`${nome}_Lamp`,
+			`${n}_L`,
 			new Vector3(2, 1, 2),
-			new Vector3(s.cx, base + ALTURA - 1, s.cz),
+			new Vector3(s.cx, s.cy + ALTURA - 1, s.cz),
 			new Color3(0, 0, 0),
+			false,
 		);
 		lamp.Transparency = 1;
-		lamp.CanCollide = false;
 		const pl = new Instance("PointLight");
 		pl.Color = new Color3(1, 0.93, 0.78);
 		pl.Range = 22;
@@ -238,95 +287,73 @@ function construirSala(s: Sala): void {
 	}
 }
 
-// --- Escadas / subsolo ---
-
 function construirEscada(s: Sala): void {
-	const nome = salaNome(s);
-	// Escada no canto sudoeste da sala
-	const sx = s.cx - s.larg / 2 + 4;
-	const sz = s.cz - s.prof / 2 + 4;
-	const base = s.cy;
-	const degraus = 6;
+	const n = `${s.id}_${s.tipo}`;
+	const sx = s.cx - s.larg / 2 + 5;
+	const sz = s.cz - s.prof / 2 + 5;
+	const deg = 6;
 	const dx = 2.4;
-	const dz = 2;
-	const dy = -math.abs(PROFUNDIDADE - base) / degraus;
+	const dy = math.abs(PROFUNDIDADE) / deg;
 
-	// Poço no chão (vazio)
 	bloco(
-		`${nome}_Poco`,
-		new Vector3(dx * degraus + 2, 2, dz + 2),
-		new Vector3(sx + (degraus * dx) / 2, base - 1, sz),
-		new Color3(0.12, 0.12, 0.14),
+		`${n}_Buraco`,
+		new Vector3(dx * deg + 3, 2.2, 4),
+		new Vector3(sx + (deg * dx) / 2, s.cy - 1, sz),
+		new Color3(0.1, 0.1, 0.12),
 	);
 
-	// Degraus
-	for (let i = 0; i < degraus; i++) {
+	for (let i = 0; i < deg; i++) {
 		bloco(
-			`${nome}_Deg_${i}`,
-			new Vector3(dx, 1, dz),
-			new Vector3(sx + i * dx, base + i * dy + 0.5, sz),
+			`${n}_Dg${i}`,
+			new Vector3(dx, 1, 3),
+			new Vector3(sx + i * dx, s.cy - i * dy - 0.5, sz),
 			new Color3(0.25, 0.25, 0.28),
 		);
-	}
-
-	// Guarda-corpo lateral (2 barras)
-	for (let i = 0; i < degraus; i++) {
 		bloco(
-			`${nome}_Grd_${i}`,
+			`${n}_Gd${i}`,
 			new Vector3(0.6, 2.5, 0.6),
-			new Vector3(sx + i * dx - 1.5, base + i * dy + 1.5, sz),
+			new Vector3(sx + i * dx - 1.8, s.cy - i * dy + 1, sz),
 			new Color3(0.4, 0.4, 0.45),
 		);
 	}
 
-	// Sala secreta no subsolo (tamanho aleatório pequeno/médio)
-	const subLarg = rng.nextInt(14, 26);
-	const subProf = rng.nextInt(14, 26);
-	const subCx = sx + degraus * dx + subLarg / 2 + 4;
-	const subCz = sz;
-	const subCy = PROFUNDIDADE;
+	const subL = rng.nextInt(14, 24);
+	const subP = rng.nextInt(14, 24);
+	const subCx = sx + deg * dx + subL / 2 + 4;
 
-	if (!colide(subCx, subCz, subLarg, subProf, -1)) {
+	if (!colide(subCx, sz, subL, subP)) {
 		const sub: Sala = {
-			id: ++idGlobal,
-			tipo: subLarg >= 22 ? "media" : "pequena",
-			larg: subLarg,
-			prof: subProf,
+			id: ++idGen,
+			tipo: subL >= 20 ? "media" : "pequena",
+			larg: subL,
+			prof: subP,
 			cx: subCx,
-			cz: subCz,
-			cy: subCy,
+			cz: sz,
+			cy: PROFUNDIDADE,
 			portas: [],
-			subsolos: 0,
 		};
 		salas.push(sub);
 		construirSala(sub);
-
-		// Conecta poço da escada com a sub-sala (corredor subterrâneo)
-		const connLarg = math.abs(subCx - sx - degraus * dx) + 4;
-		const connCx = (sx + degraus * dx + subCx) / 2;
+		const connL = math.abs(subCx - sx - deg * dx) + 4;
+		const connCx = (sx + deg * dx + subCx) / 2;
 		bloco(
-			`${nome}_Conn_${sub.id}`,
-			new Vector3(connLarg, ALTURA, dz + 2),
-			new Vector3(connCx, subCy + ALTURA / 2, sz),
-			corParede(sub.tipo),
+			`${n}_Conn`,
+			new Vector3(connL, ALTURA, 4),
+			new Vector3(connCx, PROFUNDIDADE + ALTURA / 2, sz),
+			salaCores(sub.tipo)[1],
 		);
 	}
 }
 
-// --- Geração procedural principal ---
+// ================== main ==================
 
 function gerar(): void {
-	const tamTipos = TAM_SALA as unknown as number[];
-	const tipoNomes = ["pequena", "media", "grande"] as const;
-
-	// Limpa Workspace
 	for (const c of Workspace.GetChildren()) {
 		if (c.IsA("BasePart") || c.IsA("Model")) {
 			c.Destroy();
 		}
 	}
 
-	// Clima
 	Lighting.Ambient = new Color3(0.08, 0.08, 0.1);
 	Lighting.OutdoorAmbient = new Color3(0.08, 0.08, 0.1);
 	Lighting.FogStart = 50;
@@ -334,29 +361,27 @@ function gerar(): void {
 	Lighting.GlobalShadows = true;
 	Lighting.Brightness = 0.8;
 
-	salas.clear();
-	idGlobal = 0;
+	// fase 1
+	determinarLayout();
 
-	// 1. Lobby central (grande)
-	const lobby: Sala = {
-		id: ++idGlobal,
-		tipo: "grande",
-		larg: TAM_LOBBY,
-		prof: TAM_LOBBY,
-		cx: 0,
-		cz: 0,
-		cy: 0,
-		portas: [[0, PORTA_LARG]],
-		subsolos: 0,
-	};
-	salas.push(lobby);
-	construirSala(lobby);
+	// fase 2: constrói tudo
+	for (const s of salas) {
+		construirSala(s);
+	}
 
-	// Spawn
+	// escadas (só em grandes)
+	const escadaRng = new RNG(SEED + 1000);
+	for (const s of salas) {
+		if (s.tipo === "grande" && escadaRng.next() < CHANCE_ESCADA) {
+			construirEscada(s);
+		}
+	}
+
+	// spawn
 	const spawn = new Instance("SpawnLocation");
 	spawn.Name = "Spawn";
 	spawn.Size = new Vector3(6, 1, 6);
-	spawn.Position = new Vector3(0, 1, 10);
+	spawn.Position = new Vector3(0, 1, 0);
 	spawn.Color = new Color3(0.55, 0.57, 0.6);
 	spawn.Material = Enum.Material.Plastic;
 	spawn.Anchored = true;
@@ -365,117 +390,10 @@ function gerar(): void {
 	spawn.BottomSurface = Enum.SurfaceType.Smooth;
 	spawn.Parent = Workspace;
 
-	// 2. Ramificações a partir das portas
-	type Candidato = {
-		salaRef: Sala;
-		portaIdx: number; // índice da porta na parede
-		eixoX: boolean; // true = porta nas paredes Leste/Oeste (eixo X)
-		lado: number; // +1 ou -1: direção de saída
-	};
-
-	const candidatos: Candidato[] = [];
-	for (const dir of [1, -1]) {
-		for (let i = 0; i < 2; i++) {
-			candidatos.push({ salaRef: lobby, portaIdx: i, eixoX: i === 0, lado: dir });
-		}
-	}
-
-	let tentativas = 0;
-	while (salas.size() < SALAS_MAX && candidatos.size() > 0 && tentativas < 200) {
-		tentativas++;
-		const idx = rng.nextInt(0, candidatos.size() - 1);
-		const cand = candidatos[idx];
-		candidatos.remove(idx);
-
-		const ref = cand.salaRef;
-		// Posição da porta na parede
-		const portasRef = cand.eixoX ? ref.portas : ref.portas;
-		const pc = portasRef[cand.portaIdx] ?? [0, PORTA_LARG];
-		const portaCentro = pc[0];
-		const portaLarg = math.min(pc[1], PORTA_LARG);
-
-		// Tamanho da nova sala
-		const tipoIdx = rng.nextInt(0, 2);
-		const novoLarg = tamTipos[tipoIdx];
-		const novoProf = tamTipos[tipoIdx];
-		const novoTipo = tipoNomes[tipoIdx];
-
-		// Direção de saída: 4 eixos (N/S/E/W)
-		const dirs = cand.eixoX
-			? [
-					{ eixoX: true, lado: 1 }, // Leste
-					{ eixoX: true, lado: -1 }, // Oeste
-					{ eixoX: false, lado: 1 }, // Sul
-					{ eixoX: false, lado: -1 }, // Norte
-				]
-			: [
-					{ eixoX: false, lado: 1 },
-					{ eixoX: false, lado: -1 },
-					{ eixoX: true, lado: 1 },
-					{ eixoX: true, lado: -1 },
-				];
-		rng.choose(dirs); // escolhe uma direção aleatória
-
-		let novoCx: number;
-		let novoCz: number;
-		if (cand.eixoX) {
-			// Porta nas paredes Leste/Oeste da ref
-			novoCx = ref.cx + cand.lado * ((ref.larg + novoLarg) / 2 + 2);
-			novoCz = ref.cz + portaCentro;
-		} else {
-			// Porta nas paredes Norte/Sul da ref
-			novoCx = ref.cx + portaCentro;
-			novoCz = ref.cz + cand.lado * ((ref.prof + novoProf) / 2 + 2);
-		}
-
-		if (colide(novoCx, novoCz, novoLarg, novoProf, -1)) {
-			continue;
-		}
-
-		const novaSala: Sala = {
-			id: ++idGlobal,
-			tipo: novoTipo,
-			larg: novoLarg,
-			prof: novoProf,
-			cx: novoCx,
-			cz: novoCz,
-			cy: ref.cy,
-			portas: [[0, PORTA_LARG]],
-			subsolos: 0,
-		};
-		salas.push(novaSala);
-		construirSala(novaSala);
-
-		// 3. Escada para subsolo (sala grande, 35% de chance)
-		if (novoTipo === "grande" && rng.next() < CHANCE_ESCADA && novaSala.subsolos === 0) {
-			novaSala.subsolos++;
-			construirEscada(novaSala);
-		}
-
-		// 4. Gera novos candidatos a partir desta sala (1–3 portas extras)
-		const numPortas = rng.nextInt(1, 3);
-		const dirsPossiveis = [
-			{ eixoX: true, lado: 1 },
-			{ eixoX: true, lado: -1 },
-			{ eixoX: false, lado: 1 },
-			{ eixoX: false, lado: -1 },
-		];
-		for (let p = 0; p < numPortas && candidatos.size() < SALAS_MAX; p++) {
-			const d = rng.choose(dirsPossiveis);
-			candidatos.push({ salaRef: novaSala, portaIdx: 0, eixoX: d.eixoX, lado: d.lado });
-		}
-	}
-
-	// 5. Porta final (tampa norte do lobby — acesso visual ao corredor)
-	bloco(
-		"PortaFinal_N",
-		new Vector3(PORTA_LARG + 4, ALTURA, 2),
-		new Vector3(0, ALTURA / 2, -(TAM_LOBBY / 2 + 1)),
-		new Color3(0.35, 0.35, 0.4),
-	);
+	print(`[3D] ${salas.size()} salas, ${links.size()} portas.`);
 }
 
 export function construirMapa(): void {
 	gerar();
-	print(`[3D] Mapa procedural gerado: ${salas.size()} salas, seed ${SEED}.`);
+	print(`[3D] Mapa ok: ${salas.size()} salas, seed ${SEED}.`);
 }
