@@ -1,50 +1,66 @@
 /**
- * Mapa 3D procedural determinístico — sala inicial grande + salas ramificadas
- * + escadas para salas secretas subterrâneas.
+ * Chunk manager — gera e descarta chunks ao redor do jogador.
+ * Cada chunk é 64×64 studs, dividido em 8×8 tiles de 8×8.
  *
- * Zero Interface. Material = Plastic apenas. Sem imóveis estáticos.
- * Mesmo seed = mesmo mapa sempre.
- *
- * Algoritmo: 2 fases
- *   1) Determina posições e conexões (BFS sem RNG extra)
- *   2) Constrói tudo uma vez só
+ * Geração procedural determinística (mesmo seed = mesmo mapa).
+ * Módulos: room, hall, largRoom, pilar, deadEnd, stair, blackout.
  */
-import { Lighting, Workspace } from "@rbxts/services";
-import { SEED, ALTURA, TAM_LOBBY, PORTA_LARG, SALAS_MAX, PROFUNDIDADE, CHANCE_ESCADA } from "shared/Config";
+import { Lighting, Players, Workspace } from "@rbxts/services";
+import {
+	SEED,
+	CHUNK_TAM,
+	TILE_TAM,
+	TILES_POR_CHUNK,
+	GERAR_RAIO,
+	DESCARTAR_RAIO,
+	ALTURA,
+	MODOS,
+	COR_PAREDE,
+	COR_PAREDE2,
+	COR_CHAO,
+	COR_TETO,
+	COR_LUZ,
+} from "shared/Config";
 import { RNG } from "shared/RNG";
 
-const rng = new RNG(SEED);
+// ================== tipos ==================
 
-const TAMOS = [14, 22, 32];
-const TIPOS = ["pequena", "media", "grande"];
-const PW = 2;
-const GAP = 4;
-
-let idGen = 0;
-
-interface Sala {
-	id: number;
+interface Modulo {
 	tipo: string;
-	larg: number;
-	prof: number;
-	cx: number;
-	cz: number;
-	cy: number;
-	portas: number[]; // ids das salas adjacentes com abertura
+	// portas: quais lados do chunk têm abertura (N=0, E=1, S=2, W=3)
+	portas: boolean[];
+	// tiles internos: 0=vazio, 1=chão, 2=parede, 3=pilar
+	tiles: number[][];
 }
 
-const salas: Sala[] = [];
-const links: [number, number][] = [];
+interface Chunk {
+	cx: number;
+	cz: number;
+	modelo: Model;
+	modulos: Modulo[];
+}
+
+// ================== estado ==================
+
+const chunks = new Map<string, Chunk>();
+let rngGlobal = new RNG(SEED);
 
 // ================== helpers ==================
 
-function bloco(nome: string, tam: Vector3, pos: Vector3, cor: Color3, colidi = true): Part {
+function bloco(
+	nome: string,
+	tam: Vector3,
+	pos: Vector3,
+	cor: Color3,
+	colidi = true,
+	mat = Enum.Material.Plastic,
+): Part {
 	const p = new Instance("Part");
 	p.Name = nome;
 	p.Size = tam;
 	p.Position = pos;
 	p.Color = cor;
-	p.Material = Enum.Material.Plastic;
+	p.Material = mat;
 	p.Anchored = true;
 	p.CanCollide = colidi;
 	p.TopSurface = Enum.SurfaceType.Smooth;
@@ -53,347 +69,467 @@ function bloco(nome: string, tam: Vector3, pos: Vector3, cor: Color3, colidi = t
 	return p;
 }
 
-function salaCores(tipo: string): [Color3, Color3] {
-	if (tipo === "pequena") {
-		return [new Color3(0.42, 0.4, 0.37), new Color3(0.33, 0.31, 0.29)];
-	}
-	if (tipo === "media") {
-		return [new Color3(0.35, 0.38, 0.42), new Color3(0.27, 0.29, 0.33)];
-	}
-	return [new Color3(0.28, 0.3, 0.34), new Color3(0.22, 0.24, 0.28)];
+function cor3(arr: [number, number, number]): Color3 {
+	return new Color3(arr[0], arr[1], arr[2]);
 }
 
-function colide(cx: number, cz: number, larg: number, prof: number): boolean {
-	for (const s of salas) {
-		if (math.abs(cx - s.cx) < (larg + s.larg) / 2 + 3 && math.abs(cz - s.cz) < (prof + s.prof) / 2 + 3) {
-			return true;
-		}
-	}
-	return false;
+function chunkKey(cx: number, cz: number): string {
+	return `${cx},${cz}`;
 }
 
-function find(id: number): Sala | undefined {
-	for (const s of salas) {
-		if (s.id === id) {
-			return s;
-		}
-	}
-	return undefined;
-}
+// ================== geração de módulo ==================
 
-function segmentarParede(
-	inicio: number,
-	fim: number,
-	centrosPorta: number[],
-	largPorta: number,
-): { cx: number; w: number }[] {
-	const segs: { cx: number; w: number }[] = [];
-	let cur = inicio;
-	for (const pc of centrosPorta) {
-		const pIni = pc - largPorta / 2;
-		const pFim = pc + largPorta / 2;
-		if (pIni > cur) {
-			segs.push({ cx: (cur + pIni) / 2, w: pIni - cur });
-		}
-		cur = pFim;
-	}
-	if (cur < fim) {
-		segs.push({ cx: (cur + fim) / 2, w: fim - cur });
-	}
-	return segs;
-}
+function gerarModulo(rng: RNG): Modulo {
+	// seleciona tipo por peso
+	const total =
+		MODOS["room"] +
+		MODOS["hall"] +
+		MODOS["largRoom"] +
+		MODOS["pilar"] +
+		MODOS["deadEnd"] +
+		MODOS["stair"] +
+		MODOS["blackout"];
+	let r = rng.next() * total;
+	let tipo = "room";
 
-// ================== fase 1: determinar layout ==================
-
-function determinarLayout(): void {
-	salas.clear();
-	links.clear();
-	idGen = 0;
-
-	// lobby
-	const lobby: Sala = {
-		id: ++idGen,
-		tipo: "grande",
-		larg: TAM_LOBBY,
-		prof: TAM_LOBBY,
-		cx: 0,
-		cz: 0,
-		cy: 0,
-		portas: [],
-	};
-	salas.push(lobby);
-
-	// BFS
-	type Cand = { paiId: number; dx: number; dz: number };
-	const allDirs = [
-		{ dx: 1, dz: 0 },
-		{ dx: -1, dz: 0 },
-		{ dx: 0, dz: 1 },
-		{ dx: 0, dz: -1 },
+	const tipos: [string, number][] = [
+		["room", MODOS["room"]],
+		["hall", MODOS["hall"]],
+		["largRoom", MODOS["largRoom"]],
+		["pilar", MODOS["pilar"]],
+		["deadEnd", MODOS["deadEnd"]],
+		["stair", MODOS["stair"]],
+		["blackout", MODOS["blackout"]],
 	];
-
-	const fila: Cand[] = [];
-	for (const d of allDirs) {
-		fila.push({ paiId: lobby.id, dx: d.dx, dz: d.dz });
-	}
-
-	while (salas.size() < SALAS_MAX && fila.size() > 0) {
-		const fi = rng.nextInt(0, fila.size() - 1);
-		const cand = fila[fi];
-		fila.remove(fi);
-
-		const pai = find(cand.paiId);
-		if (pai === undefined) {
-			continue;
-		}
-
-		const tipoIdx = rng.nextInt(0, 2);
-		const novoT = TAMOS[tipoIdx];
-		const novoNome = TIPOS[tipoIdx];
-
-		const ncx = cand.dx !== 0 ? pai.cx + cand.dx * ((pai.larg + novoT) / 2 + GAP) : pai.cx;
-		const ncz = cand.dz !== 0 ? pai.cz + cand.dz * ((pai.prof + novoT) / 2 + GAP) : pai.cz;
-
-		if (colide(ncx, ncz, novoT, novoT)) {
-			continue;
-		}
-
-		const nova: Sala = { id: ++idGen, tipo: novoNome, larg: novoT, prof: novoT, cx: ncx, cz: ncz, cy: 0, portas: [] };
-		salas.push(nova);
-		links.push([pai.id, nova.id]);
-		nova.portas.push(pai.id);
-		pai.portas.push(nova.id);
-
-		// filhos
-		const nFilhos = rng.nextInt(1, 3);
-		for (let i = 0; i < nFilhos && salas.size() + fila.size() < SALAS_MAX; i++) {
-			const d = rng.choose(allDirs);
-			fila.push({ paiId: nova.id, dx: d.dx, dz: d.dz });
+	for (const [t, peso] of tipos) {
+		r -= peso;
+		if (r <= 0) {
+			tipo = t;
+			break;
 		}
 	}
-}
 
-// ================== fase 2: construir tudo ==================
+	// portas: aleatório mas com pelo menos 1
+	const portas = [false, false, false, false];
+	const nPortas = tipo === "deadEnd" ? 1 : rng.nextInt(2, 4);
+	const lados = [0, 1, 2, 3];
+	// shuffle
+	for (let i = lados.size() - 1; i > 0; i--) {
+		const j = rng.nextInt(0, i);
+		const tmp = lados[i];
+		lados[i] = lados[j];
+		lados[j] = tmp;
+	}
+	for (let i = 0; i < nPortas && i < 4; i++) {
+		portas[lados[i]] = true;
+	}
 
-function construirSala(s: Sala): void {
-	const [chaoCor, paredeCor] = salaCores(s.tipo);
-	const x0 = s.cx - s.larg / 2;
-	const x1 = s.cx + s.larg / 2;
-	const z0 = s.cz - s.prof / 2;
-	const z1 = s.cz + s.prof / 2;
-	const h = ALTURA / 2 + s.cy;
-	const n = `${s.id}_${s.tipo}`;
-
-	// chão + teto
-	bloco(`${n}_Chao`, new Vector3(s.larg, 2, s.prof), new Vector3(s.cx, s.cy - 1, s.cz), chaoCor);
-	bloco(
-		`${n}_Teto`,
-		new Vector3(s.larg, 2, s.prof),
-		new Vector3(s.cx, s.cy + ALTURA + 1, s.cz),
-		new Color3(0.18, 0.19, 0.22),
-	);
-
-	// norte (z0): portas = salas com cz < s.cz
-	const nPortas: number[] = [];
-	for (const pid of s.portas) {
-		const o = find(pid);
-		if (o !== undefined && o.cz < s.cz) {
-			nPortas.push(o.cx);
+	// tiles internos 8×8
+	const tiles: number[][] = [];
+	for (let z = 0; z < TILES_POR_CHUNK; z++) {
+		tiles[z] = [];
+		for (let x = 0; x < TILES_POR_CHUNK; x++) {
+			tiles[z][x] = 1; // chão por padrão
 		}
 	}
-	nPortas.sort((a, b) => a < b);
-	for (const seg of segmentarParede(x0, x1, nPortas, PORTA_LARG)) {
-		bloco(`${n}_N_${seg.cx}`, new Vector3(seg.w, ALTURA, PW), new Vector3(seg.cx, h, z0), paredeCor);
-	}
 
-	// sul (z1): salas com cz > s.cz
-	const sPortas: number[] = [];
-	for (const pid of s.portas) {
-		const o = find(pid);
-		if (o !== undefined && o.cz > s.cz) {
-			sPortas.push(o.cx);
+	if (tipo === "room" || tipo === "largRoom") {
+		// paredes nas bordas (menos nas portas)
+		for (let i = 0; i < TILES_POR_CHUNK; i++) {
+			if (!portas[0]) {
+				tiles[0][i] = 2;
+			} // norte
+			if (!portas[2]) {
+				tiles[TILES_POR_CHUNK - 1][i] = 2;
+			} // sul
+			if (!portas[3]) {
+				tiles[i][0] = 2;
+			} // oeste
+			if (!portas[1]) {
+				tiles[i][TILES_POR_CHUNK - 1] = 2;
+			} // leste
 		}
-	}
-	sPortas.sort((a, b) => a < b);
-	for (const seg of segmentarParede(x0, x1, sPortas, PORTA_LARG)) {
-		bloco(`${n}_S_${seg.cx}`, new Vector3(seg.w, ALTURA, PW), new Vector3(seg.cx, h, z1), paredeCor);
-	}
-
-	// oeste (x0): salas com cx < s.cx
-	const wPortas: number[] = [];
-	for (const pid of s.portas) {
-		const o = find(pid);
-		if (o !== undefined && o.cx < s.cx) {
-			wPortas.push(o.cz);
-		}
-	}
-	wPortas.sort((a, b) => a < b);
-	for (const seg of segmentarParede(z0, z1, wPortas, PORTA_LARG)) {
-		bloco(`${n}_W_${seg.cx}`, new Vector3(PW, ALTURA, seg.w), new Vector3(x0, h, seg.cx), paredeCor);
-	}
-
-	// leste (x1): salas com cx > s.cx
-	const ePortas: number[] = [];
-	for (const pid of s.portas) {
-		const o = find(pid);
-		if (o !== undefined && o.cx > s.cx) {
-			ePortas.push(o.cz);
-		}
-	}
-	ePortas.sort((a, b) => a < b);
-	for (const seg of segmentarParede(z0, z1, ePortas, PORTA_LARG)) {
-		bloco(`${n}_E_${seg.cx}`, new Vector3(PW, ALTURA, seg.w), new Vector3(x1, h, seg.cx), paredeCor);
-	}
-
-	// luzes
-	if (s.larg >= 20) {
-		const cols = s.larg >= 30 ? 3 : 2;
-		const linhas = s.prof >= 30 ? 3 : 2;
-		for (let i = 0; i < cols; i++) {
-			for (let j = 0; j < linhas; j++) {
-				const lx = x0 + (s.larg * (i + 1)) / (cols + 1);
-				const lz = z0 + (s.prof * (j + 1)) / (linhas + 1);
-				const lamp = bloco(
-					`${n}_L${i}${j}`,
-					new Vector3(2, 1, 2),
-					new Vector3(lx, s.cy + ALTURA - 1, lz),
-					new Color3(0, 0, 0),
-					false,
-				);
-				lamp.Transparency = 1;
-				const pl = new Instance("PointLight");
-				pl.Color = new Color3(1, 0.93, 0.78);
-				pl.Range = 30;
-				pl.Brightness = 1.5;
-				pl.Shadows = false;
-				pl.Parent = lamp;
+		// sala grande: mais espaço interno
+		if (tipo === "largRoom") {
+			// remove paredes internas extras
+			for (let z = 2; z < TILES_POR_CHUNK - 2; z++) {
+				for (let x = 2; x < TILES_POR_CHUNK - 2; x++) {
+					tiles[z][x] = 1;
+				}
 			}
 		}
-	} else {
-		const lamp = bloco(
-			`${n}_L`,
-			new Vector3(2, 1, 2),
-			new Vector3(s.cx, s.cy + ALTURA - 1, s.cz),
-			new Color3(0, 0, 0),
-			false,
-		);
-		lamp.Transparency = 1;
-		const pl = new Instance("PointLight");
-		pl.Color = new Color3(1, 0.93, 0.78);
-		pl.Range = 22;
-		pl.Brightness = 1.5;
-		pl.Shadows = false;
-		pl.Parent = lamp;
+	} else if (tipo === "hall") {
+		// corredor: só 2 portas opostas ou adjacentes
+		const p1 = lados[0];
+		const p2 = lados[1];
+		portas[0] = false;
+		portas[1] = false;
+		portas[2] = false;
+		portas[3] = false;
+		portas[p1] = true;
+		portas[p2] = true;
+		// preenche tudo como parede, depois escava o corredor
+		for (let z = 0; z < TILES_POR_CHUNK; z++) {
+			for (let x = 0; x < TILES_POR_CHUNK; x++) {
+				tiles[z][x] = 2;
+			}
+		}
+		if (p1 === 0 || p1 === 2) {
+			// corredor vertical (N-S)
+			for (let z = 0; z < TILES_POR_CHUNK; z++) {
+				for (let x = 2; x < 6; x++) {
+					tiles[z][x] = 1;
+				}
+			}
+			// abre as portas
+			if (portas[0]) {
+				for (let x = 2; x < 6; x++) {
+					tiles[0][x] = 1;
+				}
+			}
+			if (portas[2]) {
+				for (let x = 2; x < 6; x++) {
+					tiles[TILES_POR_CHUNK - 1][x] = 1;
+				}
+			}
+		} else {
+			// corredor horizontal (W-E)
+			for (let z = 2; z < 6; z++) {
+				for (let x = 0; x < TILES_POR_CHUNK; x++) {
+					tiles[z][x] = 1;
+				}
+			}
+			if (portas[3]) {
+				for (let z = 2; z < 6; z++) {
+					tiles[z][0] = 1;
+				}
+			}
+			if (portas[1]) {
+				for (let z = 2; z < 6; z++) {
+					tiles[z][TILES_POR_CHUNK - 1] = 1;
+				}
+			}
+		}
+	} else if (tipo === "pilar") {
+		// sala com pilares em grade
+		for (let i = 0; i < TILES_POR_CHUNK; i++) {
+			if (!portas[0]) {
+				tiles[0][i] = 2;
+			}
+			if (!portas[2]) {
+				tiles[TILES_POR_CHUNK - 1][i] = 2;
+			}
+			if (!portas[3]) {
+				tiles[i][0] = 2;
+			}
+			if (!portas[1]) {
+				tiles[i][TILES_POR_CHUNK - 1] = 2;
+			}
+		}
+		// pilares a cada 3 tiles
+		for (let z = 2; z < TILES_POR_CHUNK - 1; z += 3) {
+			for (let x = 2; x < TILES_POR_CHUNK - 1; x += 3) {
+				tiles[z][x] = 3;
+			}
+		}
+	} else if (tipo === "deadEnd") {
+		// 1 porta, resto parede
+		for (let i = 0; i < TILES_POR_CHUNK; i++) {
+			tiles[0][i] = 2;
+			tiles[TILES_POR_CHUNK - 1][i] = 2;
+			tiles[i][0] = 2;
+			tiles[i][TILES_POR_CHUNK - 1] = 2;
+		}
+		// abre só 1 porta
+		if (portas[0]) {
+			for (let x = 2; x < 6; x++) {
+				tiles[0][x] = 1;
+			}
+		} else if (portas[1]) {
+			for (let z = 2; z < 6; z++) {
+				tiles[z][TILES_POR_CHUNK - 1] = 1;
+			}
+		} else if (portas[2]) {
+			for (let x = 2; x < 6; x++) {
+				tiles[TILES_POR_CHUNK - 1][x] = 1;
+			}
+		} else if (portas[3]) {
+			for (let z = 2; z < 6; z++) {
+				tiles[z][0] = 1;
+			}
+		}
+	} else if (tipo === "stair") {
+		// escada no centro
+		for (let i = 0; i < TILES_POR_CHUNK; i++) {
+			if (!portas[0]) {
+				tiles[0][i] = 2;
+			}
+			if (!portas[2]) {
+				tiles[TILES_POR_CHUNK - 1][i] = 2;
+			}
+			if (!portas[3]) {
+				tiles[i][0] = 2;
+			}
+			if (!portas[1]) {
+				tiles[i][TILES_POR_CHUNK - 1] = 2;
+			}
+		}
+	} else if (tipo === "blackout") {
+		// escuro: todas as paredes, sem portas (mas permite entrada lateral)
+		portas[0] = false;
+		portas[1] = false;
+		portas[2] = false;
+		portas[3] = false;
+		for (let z = 0; z < TILES_POR_CHUNK; z++) {
+			for (let x = 0; x < TILES_POR_CHUNK; x++) {
+				tiles[z][x] = 2;
+			}
+		}
+	}
+
+	return { tipo, portas, tiles };
+}
+
+// ================== construção visual ==================
+
+function construirChunk(cx: number, cz: number): Chunk {
+	const modelo = new Instance("Model");
+	modelo.Name = `Chunk_${cx}_${cz}`;
+
+	const baseX = cx * CHUNK_TAM;
+	const baseZ = cz * CHUNK_TAM;
+	const rng = new RNG(SEED + cx * 7919 + cz * 7907);
+
+	// gera módulo para este chunk
+	const mod = gerarModulo(rng);
+
+	// chão global do chunk (base)
+	const chaoCor = cor3(COR_CHAO);
+	const chaoTam = new Vector3(CHUNK_TAM, 1, CHUNK_TAM);
+	const chao = new Instance("Part");
+	chao.Name = "Chao";
+	chao.Size = chaoTam;
+	chao.Position = new Vector3(baseX + CHUNK_TAM / 2, -0.5, baseZ + CHUNK_TAM / 2);
+	chao.Color = chaoCor;
+	chao.Material = Enum.Material.Fabric; // carpete
+	chao.Anchored = true;
+	chao.CanCollide = true;
+	chao.TopSurface = Enum.SurfaceType.Smooth;
+	chao.BottomSurface = Enum.SurfaceType.Smooth;
+	chao.Parent = modelo;
+
+	// teto global
+	const tetoCor = cor3(COR_TETO);
+	const teto = new Instance("Part");
+	teto.Name = "Teto";
+	teto.Size = chaoTam;
+	teto.Position = new Vector3(baseX + CHUNK_TAM / 2, ALTURA + 0.5, baseZ + CHUNK_TAM / 2);
+	teto.Color = tetoCor;
+	teto.Material = Enum.Material.SmoothPlastic;
+	teto.Anchored = true;
+	teto.CanCollide = true;
+	teto.TopSurface = Enum.SurfaceType.Smooth;
+	teto.BottomSurface = Enum.SurfaceType.Smooth;
+	teto.Parent = modelo;
+
+	// constrói tiles
+	const paredeCor1 = cor3(COR_PAREDE);
+	const paredeCor2 = cor3(COR_PAREDE2);
+	const luzCor = cor3(COR_LUZ);
+
+	for (let z = 0; z < TILES_POR_CHUNK; z++) {
+		for (let x = 0; x < TILES_POR_CHUNK; x++) {
+			const tipo = mod.tiles[z][x];
+			const tx = baseX + x * TILE_TAM + TILE_TAM / 2;
+			const tz = baseZ + z * TILE_TAM + TILE_TAM / 2;
+
+			if (tipo === 2) {
+				// parede
+				const paredeCor = rng.next() > 0.5 ? paredeCor1 : paredeCor2;
+				const p = new Instance("Part");
+				p.Name = `W_${x}_${z}`;
+				p.Size = new Vector3(TILE_TAM, ALTURA, TILE_TAM);
+				p.Position = new Vector3(tx, ALTURA / 2, tz);
+				p.Color = paredeCor;
+				p.Material = Enum.Material.SmoothPlastic; // parede lisa (wallpaper)
+				p.Anchored = true;
+				p.CanCollide = true;
+				p.TopSurface = Enum.SurfaceType.Smooth;
+				p.BottomSurface = Enum.SurfaceType.Smooth;
+				p.Parent = modelo;
+			} else if (tipo === 3) {
+				// pilar
+				const p = new Instance("Part");
+				p.Name = `P_${x}_${z}`;
+				p.Size = new Vector3(TILE_TAM * 0.6, ALTURA, TILE_TAM * 0.6);
+				p.Position = new Vector3(tx, ALTURA / 2, tz);
+				p.Color = paredeCor1;
+				p.Material = Enum.Material.SmoothPlastic;
+				p.Anchored = true;
+				p.CanCollide = true;
+				p.TopSurface = Enum.SurfaceType.Smooth;
+				p.BottomSurface = Enum.SurfaceType.Smooth;
+				p.Parent = modelo;
+			}
+		}
+	}
+
+	// iluminação fluorescente (teto)
+	if (mod.tipo !== "blackout") {
+		const nLuzes = mod.tipo === "largRoom" ? 4 : mod.tipo === "pilar" ? 3 : 2;
+		for (let i = 0; i < nLuzes; i++) {
+			const lx = baseX + (CHUNK_TAM * (i + 1)) / (nLuzes + 1);
+			const lz = baseZ + CHUNK_TAM / 2;
+
+			// tubo fluorescente (part fino no teto)
+			const tubo = new Instance("Part");
+			tubo.Name = `Fluor_${i}`;
+			tubo.Size = new Vector3(0.4, 0.3, CHUNK_TAM * 0.6);
+			tubo.Position = new Vector3(lx, ALTURA - 0.15, lz);
+			tubo.Color = new Color3(0.95, 0.95, 0.9);
+			tubo.Material = Enum.Material.Neon;
+			tubo.Anchored = true;
+			tubo.CanCollide = false;
+			tubo.TopSurface = Enum.SurfaceType.Smooth;
+			tubo.BottomSurface = Enum.SurfaceType.Smooth;
+			tubo.Parent = modelo;
+
+			// PointLight
+			const pl = new Instance("PointLight");
+			pl.Color = luzCor;
+			pl.Range = 40;
+			pl.Brightness = 1.2;
+			pl.Shadows = false;
+			pl.Parent = tubo;
+		}
+	}
+
+	// escada (se módulo é stair)
+	if (mod.tipo === "stair") {
+		const sx = baseX + CHUNK_TAM / 2 - 8;
+		const sz = baseZ + CHUNK_TAM / 2;
+		const deg = 6;
+		const dx = 2.5;
+		for (let i = 0; i < deg; i++) {
+			const d = new Instance("Part");
+			d.Name = `Deg_${i}`;
+			d.Size = new Vector3(dx, 1, 4);
+			d.Position = new Vector3(sx + i * dx, i * -2 + 0.5, sz);
+			d.Color = new Color3(0.4, 0.38, 0.35);
+			d.Material = Enum.Material.Concrete;
+			d.Anchored = true;
+			d.CanCollide = true;
+			d.TopSurface = Enum.SurfaceType.Smooth;
+			d.BottomSurface = Enum.SurfaceType.Smooth;
+			d.Parent = modelo;
+		}
+	}
+
+	modelo.Parent = Workspace;
+
+	return { cx, cz, modelo, modulos: [mod] };
+}
+
+// ================== sistema de chunks ==================
+
+function gerarChunksProximos(jogadorX: number, jogadorZ: number): void {
+	const jcX = math.floor(jogadorX / CHUNK_TAM);
+	const jcZ = math.floor(jogadorZ / CHUNK_TAM);
+
+	for (let dx = -GERAR_RAIO; dx <= GERAR_RAIO; dx++) {
+		for (let dz = -GERAR_RAIO; dz <= GERAR_RAIO; dz++) {
+			const key = chunkKey(jcX + dx, jcZ + dz);
+			if (!chunks.has(key)) {
+				const chunk = construirChunk(jcX + dx, jcZ + dz);
+				chunks.set(key, chunk);
+			}
+		}
+	}
+
+	// descarta chunks distantes
+	const paraApagar: string[] = [];
+	for (const [key, chunk] of chunks) {
+		const distX = math.abs(chunk.cx - jcX);
+		const distZ = math.abs(chunk.cz - jcZ);
+		if (distX > DESCARTAR_RAIO || distZ > DESCARTAR_RAIO) {
+			paraApagar.push(key);
+		}
+	}
+	for (const key of paraApagar) {
+		const chunk = chunks.get(key);
+		if (chunk !== undefined) {
+			chunk.modelo.Destroy();
+			chunks.delete(key);
+		}
 	}
 }
 
-function construirEscada(s: Sala): void {
-	const n = `${s.id}_${s.tipo}`;
-	const sx = s.cx - s.larg / 2 + 5;
-	const sz = s.cz - s.prof / 2 + 5;
-	const deg = 6;
-	const dx = 2.4;
-	const dy = math.abs(PROFUNDIDADE) / deg;
+// ================== loop principal ==================
 
-	bloco(
-		`${n}_Buraco`,
-		new Vector3(dx * deg + 3, 2.2, 4),
-		new Vector3(sx + (deg * dx) / 2, s.cy - 1, sz),
-		new Color3(0.1, 0.1, 0.12),
-	);
+let inicializado = false;
 
-	for (let i = 0; i < deg; i++) {
-		bloco(
-			`${n}_Dg${i}`,
-			new Vector3(dx, 1, 3),
-			new Vector3(sx + i * dx, s.cy - i * dy - 0.5, sz),
-			new Color3(0.25, 0.25, 0.28),
-		);
-		bloco(
-			`${n}_Gd${i}`,
-			new Vector3(0.6, 2.5, 0.6),
-			new Vector3(sx + i * dx - 1.8, s.cy - i * dy + 1, sz),
-			new Color3(0.4, 0.4, 0.45),
-		);
+function iniciar(): void {
+	if (inicializado) {
+		return;
 	}
+	inicializado = true;
 
-	const subL = rng.nextInt(14, 24);
-	const subP = rng.nextInt(14, 24);
-	const subCx = sx + deg * dx + subL / 2 + 4;
-
-	if (!colide(subCx, sz, subL, subP)) {
-		const sub: Sala = {
-			id: ++idGen,
-			tipo: subL >= 20 ? "media" : "pequena",
-			larg: subL,
-			prof: subP,
-			cx: subCx,
-			cz: sz,
-			cy: PROFUNDIDADE,
-			portas: [],
-		};
-		salas.push(sub);
-		construirSala(sub);
-		const connL = math.abs(subCx - sx - deg * dx) + 4;
-		const connCx = (sx + deg * dx + subCx) / 2;
-		bloco(
-			`${n}_Conn`,
-			new Vector3(connL, ALTURA, 4),
-			new Vector3(connCx, PROFUNDIDADE + ALTURA / 2, sz),
-			salaCores(sub.tipo)[1],
-		);
-	}
-}
-
-// ================== main ==================
-
-function gerar(): void {
+	// limpa workspace (ignora Terrain — não pode ser Destroy)
 	for (const c of Workspace.GetChildren()) {
+		if (c.IsA("Terrain")) {
+			continue;
+		}
 		if (c.IsA("BasePart") || c.IsA("Model")) {
 			c.Destroy();
 		}
 	}
 
-	Lighting.Ambient = new Color3(0.08, 0.08, 0.1);
-	Lighting.OutdoorAmbient = new Color3(0.08, 0.08, 0.1);
-	Lighting.FogStart = 50;
-	Lighting.FogEnd = 200;
-	Lighting.GlobalShadows = true;
-	Lighting.Brightness = 0.8;
+	// clima Backrooms
+	Lighting.Ambient = new Color3(0.5, 0.48, 0.4);
+	Lighting.OutdoorAmbient = new Color3(0.15, 0.15, 0.12);
+	Lighting.FogStart = 0;
+	Lighting.FogEnd = 120;
+	Lighting.FogColor = new Color3(0.7, 0.65, 0.5);
+	Lighting.GlobalShadows = false;
+	Lighting.Brightness = 0.3;
+	Lighting.ClockTime = 14; // tarde eterna
 
-	// fase 1
-	determinarLayout();
-
-	// fase 2: constrói tudo
-	for (const s of salas) {
-		construirSala(s);
-	}
-
-	// escadas (só em grandes)
-	const escadaRng = new RNG(SEED + 1000);
-	for (const s of salas) {
-		if (s.tipo === "grande" && escadaRng.next() < CHANCE_ESCADA) {
-			construirEscada(s);
-		}
-	}
+	// gera chunk inicial
+	gerarChunksProximos(0, 0);
 
 	// spawn
 	const spawn = new Instance("SpawnLocation");
 	spawn.Name = "Spawn";
 	spawn.Size = new Vector3(6, 1, 6);
 	spawn.Position = new Vector3(0, 1, 0);
-	spawn.Color = new Color3(0.55, 0.57, 0.6);
-	spawn.Material = Enum.Material.Plastic;
+	spawn.Color = cor3(COR_CHAO);
+	spawn.Material = Enum.Material.Fabric;
 	spawn.Anchored = true;
 	spawn.Neutral = true;
 	spawn.TopSurface = Enum.SurfaceType.Smooth;
 	spawn.BottomSurface = Enum.SurfaceType.Smooth;
 	spawn.Parent = Workspace;
 
-	print(`[3D] ${salas.size()} salas, ${links.size()} portas.`);
+	// loop de atualização
+	const conn = game.GetService("RunService").Heartbeat.Connect(() => {
+		const player = Players.GetChildren()[0] as Player | undefined;
+		if (player === undefined) {
+			return;
+		}
+		const char = player.Character;
+		if (char === undefined) {
+			return;
+		}
+		const hrp = char.FindFirstChild("HumanoidRootPart") as Part | undefined;
+		if (hrp === undefined) {
+			return;
+		}
+		gerarChunksProximos(hrp.Position.X, hrp.Position.Z);
+	});
+
+	print("[Backrooms] Servidor no ar. Chunks gerados ao redor do jogador.");
 }
 
 export function construirMapa(): void {
-	gerar();
-	print(`[3D] Mapa ok: ${salas.size()} salas, seed ${SEED}.`);
+	iniciar();
 }
