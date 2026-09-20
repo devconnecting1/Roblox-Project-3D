@@ -1,14 +1,17 @@
 /**
- * Config 3D (SHARED) — paleta e dimensões do mapa, fonte única
- * para servidor e cliente.
+ * Configuração da geração procedural (SHARED).
+ * Mesmo seed = mesmo mapa em todas as máquinas.
  */
-export const ALTURA_PE = 12;
-export const COR_PAREDE: [number, number, number] = [0.16, 0.17, 0.21];
-export const SALAS: { nome: string; cor: [number, number, number] }[] = [
-	{ nome: "Lobby", cor: [0.55, 0.57, 0.63] },
-	{ nome: "Corredor", cor: [0.32, 0.33, 0.38] },
-	{ nome: "SalaVerde", cor: [0.24, 0.55, 0.28] },
-	{ nome: "SalaAzul", cor: [0.23, 0.43, 0.71] },
-	{ nome: "SalaLaranja", cor: [0.71, 0.42, 0.16] },
-	{ nome: "SalaRoxa", cor: [0.55, 0.35, 0.71] },
-];
+export const SEED = 42;
+
+// Salas
+export const ALTURA = 12;
+export const TAM_LOBBY = 36;
+export const TAM_SALA = [14, 22, 32] as const; // pequena / média / grande
+export const PORTA_LARG = 8;
+export const SALAS_MAX = 30;
+export const CBASE = 0;
+
+// Escadas → subsolo
+export const PROFUNDIDADE = -16; // Y do subsolo
+export const CHANCE_ESCADA = 0.35; // 35% das salas grandes ganham escada
