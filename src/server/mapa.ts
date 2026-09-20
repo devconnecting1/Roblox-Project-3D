@@ -34,6 +34,7 @@ interface Sala {
 }
 
 const salas: Sala[] = [];
+let idGlobal = 0;
 
 // --- Helpers ---
 
